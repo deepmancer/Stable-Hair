@@ -1,4 +1,4 @@
-import gradio as gr
+import argparse
 import torch
 from PIL import Image
 import numpy as np
@@ -6,6 +6,9 @@ from PIL import Image
 from omegaconf import OmegaConf
 import os
 import cv2
+import pandas as pd
+from pathlib import Path
+from tqdm.auto import tqdm
 from diffusers import DDIMScheduler, UniPCMultistepScheduler
 from diffusers.models import UNet2DConditionModel
 from ref_encoder.latent_controlnet import ControlNetModel
@@ -134,10 +137,131 @@ class StableHair:
         return image
 
 
+def main(args):
+    """Main function for batch processing hair transfer."""
+    # Initialize model
+    model = StableHair(config=args.config, weight_dtype=torch.float16)
+    
+    # Load pairs from CSV file
+    data_dir = Path(args.data_dir)
+    pairs_csv_path = data_dir / 'pairs.csv'
+    if not pairs_csv_path.exists():
+        raise FileNotFoundError(f"pairs.csv not found in {data_dir}")
+    
+    df = pd.read_csv(pairs_csv_path)
+    
+    # Validate required columns
+    if 'source_id' not in df.columns or 'target_id' not in df.columns:
+        raise ValueError("pairs.csv must contain 'source_id' and 'target_id' columns")
+    
+    # Shuffle the pairs for consistent ordering with other methods
+    df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+    
+    # Setup paths
+    image_dir = data_dir / 'image'
+    if not image_dir.exists():
+        raise FileNotFoundError(f"image folder not found in {data_dir}")
+    
+    # Inference parameters
+    random_seed = args.seed
+    step = args.steps
+    guidance_scale = args.guidance_scale
+    scale = args.scale
+    controlnet_conditioning_scale = args.controlnet_scale
+    size = args.size
+    
+    # Process each pair
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Processing pairs"):
+        source_id = str(row['source_id'])
+        target_id = str(row['target_id'])
+        
+        # Construct image paths
+        # source_id = face (identity to keep)
+        # target_id = hair reference (hair style to transfer)
+        source_path = image_dir / f'{source_id}.png'
+        target_path = image_dir / f'{target_id}.png'
+        
+        # Check if images exist
+        if not source_path.exists():
+            print(f"Warning: Source image not found: {source_path}")
+            continue
+        if not target_path.exists():
+            print(f"Warning: Target image not found: {target_path}")
+            continue
+        
+        # Output directory: {data_dir}/baselines/stablehair/{target_id}_to_{source_id}/
+        sample_id = f'{target_id}_to_{source_id}'
+        output_dir = data_dir / 'baselines' / 'stablehair' / sample_id
+        
+        # Output paths
+        transferred_path = output_dir / 'transferred.png'
+        bald_path = output_dir / 'source_bald.png'
+        
+        # Skip if already processed
+        if transferred_path.exists() and bald_path.exists():
+            continue
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        try:
+            # Load images
+            source_image = Image.open(source_path).convert("RGB").resize((size, size))
+            reference_image = np.array(Image.open(target_path).convert("RGB").resize((size, size)))
+            
+            # Get bald version of source
+            source_image_bald = np.array(model.get_bald(source_image, scale=0.9))
+            H, W, C = source_image_bald.shape
+            
+            # Generate transferred image
+            set_scale(model.pipeline.unet, scale)
+            generator = torch.Generator(device="cuda")
+            generator.manual_seed(random_seed)
+            
+            sample = model.pipeline(
+                "",  # prompt
+                negative_prompt="",
+                num_inference_steps=step,
+                guidance_scale=guidance_scale,
+                width=W,
+                height=H,
+                controlnet_condition=source_image_bald,
+                controlnet_conditioning_scale=controlnet_conditioning_scale,
+                generator=generator,
+                reference_encoder=model.hair_encoder,
+                ref_image=reference_image,
+            ).samples
+            
+            # Save outputs
+            # Save bald image
+            Image.fromarray(source_image_bald).save(bald_path)
+            
+            # Save transferred image (sample is numpy array in 0-1 range)
+            transferred_img = Image.fromarray((sample * 255.).astype(np.uint8))
+            transferred_img.save(transferred_path)
+            
+        except Exception as e:
+            print(f"Error processing {sample_id}: {e}")
+            continue
+    
+    print("Processing complete!")
+
+
 if __name__ == '__main__':
-    model = StableHair(config="./configs/hair_transfer.yaml", weight_dtype=torch.float32)
-    kwargs = OmegaConf.to_container(model.config.inference_kwargs)
-    id, image, source_image_bald, reference_image = model.Hair_Transfer(**kwargs)
-    os.makedirs(model.config.output_path, exist_ok=True)
-    output_file = os.path.join(model.config.output_path, model.config.save_name)
-    concatenate_images([id, source_image_bald, reference_image, (image*255.).astype(np.uint8)], output_file=output_file, type="np")
+    parser = argparse.ArgumentParser(description='Stable-Hair batch inference')
+    
+    # Data directory argument
+    parser.add_argument('--data_dir', type=str, default="/workspace/celeba_subset",
+                        help='Directory containing pairs.csv and image/ folder')
+    parser.add_argument('--config', type=str, default="./configs/hair_transfer.yaml",
+                        help='Path to config file')
+    
+    # Inference parameters
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--steps', type=int, default=30, help='Number of inference steps')
+    parser.add_argument('--guidance_scale', type=float, default=2.0, help='Guidance scale')
+    parser.add_argument('--scale', type=float, default=1.0, help='Adapter scale')
+    parser.add_argument('--controlnet_scale', type=float, default=1.0, help='ControlNet conditioning scale')
+    parser.add_argument('--size', type=int, default=512, help='Image size')
+    
+    args = parser.parse_args()
+    main(args)
